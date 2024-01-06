@@ -1,32 +1,83 @@
-import express from 'express';
-import logger from 'morgan';
-import { createServer } from 'http'; // Import createServer from http module
-import { Server } from 'socket.io';
+import express from 'express'
+import logger from 'morgan'
+import dotenv from 'dotenv'
+import { createClient } from '@libsql/client'
+import { Server } from 'socket.io'
+import { createServer } from 'http'
 
-const port = process.env.PORT || 3000;
-const app = express();
-const httpServer = createServer(app); // Create an HTTP server
-const io = new Server(httpServer); // Pass the HTTP server to socket.io
+dotenv.config()
 
-io.on('connection', (socket) => {
-    console.log('A user has connected!')
+const port = process.env.PORT ?? 3000
 
-    // Listen for disconnect event inside the connection event handler
-    socket.on('disconnect', () => {
-        console.log('A user has disconnected!')
-    })
-    socket.on('chat message', (msg) => {
-        io.emit('chat message', msg)
-        })
+const app = express()
+const server = createServer(app)
+const io = new Server(server, {
+  connectionStateRecovery: {}
 })
 
+const db = createClient({
+  url: 'libsql://unique-bounty-santos-arellano.turso.io',
+  authToken: process.env.DB_TOKEN
+})
 
-app.use(logger('dev'));
+async function createMessagesTable() {
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      content TEXT,
+      username TEXT
+    )
+  `)
+}
+
+io.on('connection', async (socket) => {
+  console.log('A user has connected!')
+
+  socket.on('disconnect', () => {
+    console.log('A user has disconnected!')
+  })
+
+  socket.on('chat message', async (msg) => {
+    let result
+    const username = socket.handshake.auth.username ?? 'anonymous'
+    console.log({ username })
+    try {
+      result = await db.execute({
+        sql: 'INSERT INTO messages (content, username) VALUES (:msg, :username)',
+        args: { msg, username }
+      })
+    } catch (e) {
+      console.error(e)
+      return
+    }
+
+    io.emit('chat message', msg, result.lastInsertRowid.toString(), username)
+  })
+
+  if (!socket.recovered) { // <- recuperar los mensajes sin conexión
+    try {
+      const results = await db.execute({
+        sql: 'SELECT id, content, username FROM messages WHERE id > ?',
+        args: [socket.handshake.auth.serverOffset ?? 0]
+      })
+
+      results.rows.forEach(row => {
+        socket.emit('chat message', row.content, row.id.toString(), row.username)
+      })
+    } catch (e) {
+      console.error(e)
+    }
+  }
+})
+
+app.use(logger('dev'))
 
 app.get('/', (req, res) => {
-    res.sendFile(process.cwd() + '/client/index.html');
-});
+  res.sendFile(process.cwd() + '/client/index.html')
+})
 
-httpServer.listen(port, () => {
-    console.log(`Server running on port ${port}`);
-});
+createMessagesTable().then(() => {
+  server.listen(port, () => {
+    console.log(`Server running on port ${port}`)
+  })
+})
